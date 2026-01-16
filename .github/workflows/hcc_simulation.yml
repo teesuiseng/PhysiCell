@@ -1,0 +1,62 @@
+name: HCC KHK Simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      khk_level:
+        description: 'KHK expression level (11-20)'
+        required: true
+        default: '17.0'
+        type: string
+      simulation_time:
+        description: 'Simulation time (minutes)'
+        required: true
+        default: '360'
+        type: string
+      patient_id:
+        description: 'Patient ID'
+        required: false
+        default: 'test'
+        type: string
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libxml2-dev zlib1g-dev
+      
+      - name: Update config with parameters
+        run: |
+          sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
+          sed -i "s/<max_time.*<\/max_time>/<max_time units=\"min\">${{ github.event.inputs.simulation_time }}<\/max_time>/" config/PhysiCell_settings.xml
+      
+      - name: Compile PhysiCell
+        run: |
+          make clean
+          make
+      
+      - name: Run simulation
+        run: |
+          ./project
+      
+      - name: Create summary
+        run: |
+          echo "Simulation complete!" > summary.md
+          echo "Patient: ${{ github.event.inputs.patient_id }}" >> summary.md
+          echo "KHK: ${{ github.event.inputs.khk_level }}" >> summary.md
+          ls -lh output/ >> summary.md
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: sim-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
+          path: |
+            output/
+            summary.md
