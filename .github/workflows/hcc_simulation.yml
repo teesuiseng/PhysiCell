@@ -44,7 +44,7 @@ jobs:
             echo "ERROR: custom.h not found!"
             exit 1
           fi
-          echo "✓ Custom files found"
+          echo "✓ Custom files verified"
       
       - name: Update config with parameters
         run: |
@@ -55,18 +55,16 @@ jobs:
       
       - name: Compile PhysiCell
         run: |
-          echo "=== Starting compilation ==="
-          make reset
+          echo "=== Cleaning previous build (safe) ==="
+          make clean
+          
+          echo ""
+          echo "=== Compiling PhysiCell ==="
           make
+          
           echo ""
           echo "=== Checking for executable ==="
-          ls -lh
-          if [ ! -f project ] && [ ! -f myproj ] && [ ! -f main ]; then
-            echo "ERROR: No executable created!"
-            echo "Trying alternative compilation..."
-            make PROJECT=project
-            ls -lh
-          fi
+          ls -lh | grep -E "(project|myproj|main)" || ls -lh
       
       - name: Run simulation
         run: |
@@ -74,11 +72,12 @@ jobs:
           if [ -f ./project ]; then
             EXEC=./project
           elif [ -f ./myproj ]; then
-            EXEC=./myproj
+            EXEC=./myproj  
           elif [ -f ./main ]; then
             EXEC=./main
           else
-            echo "ERROR: No PhysiCell executable found!"
+            echo "ERROR: No executable found!"
+            echo "Contents of directory:"
             ls -la
             exit 1
           fi
@@ -86,29 +85,49 @@ jobs:
           echo "Running: $EXEC"
           $EXEC
       
-      - name: Verify output
+      - name: Verify output generated
         run: |
-          echo "=== Checking simulation output ==="
           if [ ! -d output ]; then
             echo "ERROR: Output directory not created!"
             exit 1
           fi
+          
+          echo "=== Simulation output ==="
           ls -lh output/
+          
           FILE_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
-          echo "Generated $FILE_COUNT XML files"
+          echo ""
+          echo "Generated $FILE_COUNT XML output files"
+          
+          SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
+          echo "Generated $SVG_COUNT SVG visualization files"
       
       - name: Create summary
         run: |
-          echo "# Simulation Results" > summary.md
+          echo "# HCC KHK Simulation Results" > summary.md
           echo "" >> summary.md
           echo "**Patient ID:** ${{ github.event.inputs.patient_id }}" >> summary.md
-          echo "**KHK Expression:** ${{ github.event.inputs.khk_level }}" >> summary.md
-          echo "**Simulation Time:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
+          echo "**KHK Expression Level:** ${{ github.event.inputs.khk_level }}" >> summary.md
+          echo "**Simulation Duration:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
           echo "" >> summary.md
-          echo "## Output Files" >> summary.md
+          echo "---" >> summary.md
+          echo "" >> summary.md
+          echo "## Output Files Generated" >> summary.md
+          echo "" >> summary.md
           echo "\`\`\`" >> summary.md
           ls -lh output/ >> summary.md
           echo "\`\`\`" >> summary.md
+          echo "" >> summary.md
+          echo "## Quick Stats" >> summary.md
+          XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
+          SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
+          echo "- XML files: $XML_COUNT" >> summary.md
+          echo "- SVG files: $SVG_COUNT" >> summary.md
+          echo "" >> summary.md
+          echo "## How to View Results" >> summary.md
+          echo "1. Download and unzip this artifact" >> summary.md
+          echo "2. Open any \`snapshot*.svg\` file in a web browser to see tumor visualization" >> summary.md
+          echo "3. Final snapshot: \`snapshot$(printf '%08d' $((XML_COUNT - 1))).svg\`" >> summary.md
       
       - name: Upload simulation results
         uses: actions/upload-artifact@v4
