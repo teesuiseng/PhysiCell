@@ -32,145 +32,97 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libxml2-dev zlib1g-dev
       
-      - name: Verify custom files exist
+      - name: Verify custom files
         run: |
-          echo "=== Checking custom modules ==="
+          echo "=== Custom modules ==="
           ls -la custom_modules/
-          if [ ! -f custom_modules/custom.cpp ]; then
-            echo "ERROR: custom.cpp not found!"
+          if [ ! -f custom_modules/custom.cpp ] || [ ! -f custom_modules/custom.h ]; then
+            echo "ERROR: Custom files missing!"
             exit 1
           fi
-          if [ ! -f custom_modules/custom.h ]; then
-            echo "ERROR: custom.h not found!"
-            exit 1
-          fi
-          echo "✓ Custom files verified"
+          echo "✓ Custom files found"
       
-      - name: Update config with parameters
+      - name: Update config
         run: |
           sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
           sed -i "s/<max_time.*<\/max_time>/<max_time units=\"min\">${{ github.event.inputs.simulation_time }}<\/max_time>/" config/PhysiCell_settings.xml
-          echo "=== Updated Configuration ==="
-          cat config/PhysiCell_settings.xml | grep -A2 "user_parameters"
+          echo "=== Config updated ==="
+          grep -A2 "user_parameters" config/PhysiCell_settings.xml
       
-      - name: Compile PhysiCell with custom modules
+      - name: Compile
         run: |
-          echo "=== Setting up custom project ==="
-          # Link main.cpp to use custom modules
-          cp main.cpp main-backup.cpp
-          
-          echo "=== Cleaning previous build ==="
           make clean
-          
-          echo ""
-          echo "=== Compiling with custom modules ==="
-          # Compile custom modules explicitly
-          make PhysiCell_custom.o
-          
-          # Build the full project
           make
-          
-          echo ""
-          echo "=== Checking compilation results ==="
-          ls -lh | grep -E "^-rwx" || echo "No executables found yet"
-          
-          # If still no executable, try explicit linking
-          if [ ! -f project ] && [ ! -f myproj ] && [ ! -f heterogeneity ]; then
-            echo "Attempting manual linking..."
-            g++ -std=c++11 -O3 -fomit-frame-pointer -fopenmp -m64 -o project \
-              main.cpp \
-              PhysiCell_*.o BioFVM_*.o pugixml.o custom.o \
-              -lz -lgomp
-          fi
-          
-          echo ""
-          echo "=== Final executable check ==="
-          ls -lh | grep -E "^-rwx"
+          echo "=== Compilation complete ==="
+          ls -lh heterogeneity
       
       - name: Run simulation
         run: |
-          # Try different executable names
-          if [ -f ./project ]; then
-            EXEC=./project
-            echo "Using: project"
-          elif [ -f ./heterogeneity ]; then
-            EXEC=./heterogeneity
-            echo "Using: heterogeneity (will work with custom code)"
-          elif [ -f ./myproj ]; then
-            EXEC=./myproj
-            echo "Using: myproj"
-          else
-            echo "ERROR: No executable found!"
-            echo "Available files:"
-            ls -lh | grep -E "^-rwx"
-            exit 1
-          fi
-          
-          echo "Running simulation with: $EXEC"
-          $EXEC
+          echo "=== Starting HCC-KHK simulation ==="
+          echo "KHK level: ${{ github.event.inputs.khk_level }}"
+          echo "Duration: ${{ github.event.inputs.simulation_time }} min"
+          ./heterogeneity
       
-      - name: Verify output generated
+      - name: Check output
         run: |
           if [ ! -d output ]; then
-            echo "ERROR: Output directory not created!"
+            echo "ERROR: No output directory!"
             exit 1
           fi
-          
-          echo "=== Simulation output ==="
-          ls -lh output/
           
           XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
           SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
           
-          echo ""
-          echo "✓ Generated $XML_COUNT XML files"
-          echo "✓ Generated $SVG_COUNT SVG files"
+          echo "=== Results ==="
+          echo "XML files: $XML_COUNT"
+          echo "SVG files: $SVG_COUNT"
           
           if [ $XML_COUNT -eq 0 ]; then
-            echo "ERROR: No output files generated!"
+            echo "ERROR: No output generated!"
+            ls -la output/
             exit 1
           fi
+          
+          echo "✓ Simulation completed successfully"
       
       - name: Create summary
         run: |
-          echo "# HCC KHK Simulation Results" > summary.md
-          echo "" >> summary.md
-          echo "**Patient ID:** ${{ github.event.inputs.patient_id }}" >> summary.md
-          echo "**KHK Expression:** ${{ github.event.inputs.khk_level }}" >> summary.md
-          echo "**Duration:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
-          echo "" >> summary.md
-          echo "---" >> summary.md
-          echo "" >> summary.md
+          cat > summary.md << EOF
+          # HCC KHK Simulation Results
           
-          XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
-          SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
+          **Patient ID:** ${{ github.event.inputs.patient_id }}
+          **KHK Expression:** ${{ github.event.inputs.khk_level }}
+          **Simulation Time:** ${{ github.event.inputs.simulation_time }} minutes
           
-          echo "## Output Summary" >> summary.md
-          echo "- **XML files:** $XML_COUNT" >> summary.md
-          echo "- **SVG files:** $SVG_COUNT" >> summary.md
-          echo "" >> summary.md
+          ---
           
-          echo "## Files Generated" >> summary.md
-          echo "\`\`\`" >> summary.md
-          ls -lh output/ | tail -20 >> summary.md
-          echo "\`\`\`" >> summary.md
-          echo "" >> summary.md
+          ## Output Files
           
-          echo "## How to View" >> summary.md
-          echo "1. Download and extract this artifact" >> summary.md
-          echo "2. Open \`snapshot*.svg\` files in a web browser" >> summary.md
-          echo "3. Cells are colored by KHK level:" >> summary.md
-          echo "   - **Blue**: Low KHK (<16)" >> summary.md
-          echo "   - **Yellow**: Medium KHK (16-18)" >> summary.md
-          echo "   - **Red**: High KHK (>18)" >> summary.md
+          \`\`\`
+          $(ls -lh output/)
+          \`\`\`
           
-          echo "" >> summary.md
-          echo "Last snapshot: \`snapshot$(printf '%08d' $((XML_COUNT - 1))).svg\`" >> summary.md
+          ## File Counts
+          - XML data files: $(ls output/*.xml 2>/dev/null | wc -l)
+          - SVG visualizations: $(ls output/*.svg 2>/dev/null | wc -l)
+          
+          ## How to View Results
+          1. Download and extract this artifact
+          2. Open any \`snapshot*.svg\` file in a web browser
+          3. Cell colors indicate KHK expression level:
+             - **Blue**: Low KHK (<16)
+             - **Yellow**: Medium KHK (16-18)  
+             - **Red**: High KHK (>18)
+          
+          ## Timepoints
+          - One snapshot per hour of simulation
+          - Final timepoint: snapshot$(printf '%08d' $(($(ls output/*.xml 2>/dev/null | wc -l) - 1))).svg
+          EOF
       
-      - name: Upload simulation results
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: simulation-khk${{ github.event.inputs.khk_level }}-patient${{ github.event.inputs.patient_id }}
+          name: hcc-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
           path: |
             output/
             summary.md
