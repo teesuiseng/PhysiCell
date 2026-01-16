@@ -32,6 +32,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libxml2-dev zlib1g-dev
       
+      - name: Verify custom files exist
+        run: |
+          echo "=== Checking custom modules ==="
+          ls -la custom_modules/
+          if [ ! -f custom_modules/custom.cpp ]; then
+            echo "ERROR: custom.cpp not found!"
+            exit 1
+          fi
+          if [ ! -f custom_modules/custom.h ]; then
+            echo "ERROR: custom.h not found!"
+            exit 1
+          fi
+          echo "✓ Custom files found"
+      
       - name: Update config with parameters
         run: |
           sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
@@ -41,12 +55,47 @@ jobs:
       
       - name: Compile PhysiCell
         run: |
-          make clean
+          echo "=== Starting compilation ==="
+          make reset
           make
+          echo ""
+          echo "=== Checking for executable ==="
+          ls -lh
+          if [ ! -f project ] && [ ! -f myproj ] && [ ! -f main ]; then
+            echo "ERROR: No executable created!"
+            echo "Trying alternative compilation..."
+            make PROJECT=project
+            ls -lh
+          fi
       
       - name: Run simulation
         run: |
-          ./project
+          # Find the executable
+          if [ -f ./project ]; then
+            EXEC=./project
+          elif [ -f ./myproj ]; then
+            EXEC=./myproj
+          elif [ -f ./main ]; then
+            EXEC=./main
+          else
+            echo "ERROR: No PhysiCell executable found!"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Running: $EXEC"
+          $EXEC
+      
+      - name: Verify output
+        run: |
+          echo "=== Checking simulation output ==="
+          if [ ! -d output ]; then
+            echo "ERROR: Output directory not created!"
+            exit 1
+          fi
+          ls -lh output/
+          FILE_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
+          echo "Generated $FILE_COUNT XML files"
       
       - name: Create summary
         run: |
@@ -60,12 +109,6 @@ jobs:
           echo "\`\`\`" >> summary.md
           ls -lh output/ >> summary.md
           echo "\`\`\`" >> summary.md
-          echo "" >> summary.md
-          echo "## Final Cell Count" >> summary.md
-          if [ -f output/output*.xml ]; then
-            LAST_OUTPUT=$(ls output/output*.xml | tail -1)
-            grep -A1 "number_of_cells" "$LAST_OUTPUT" | tail -1 >> summary.md || echo "N/A" >> summary.md
-          fi
       
       - name: Upload simulation results
         uses: actions/upload-artifact@v4
@@ -75,4 +118,3 @@ jobs:
             output/
             summary.md
           retention-days: 30
-          compression-level: 6
