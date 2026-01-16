@@ -1,0 +1,41 @@
+name: HCC KHK Growth Simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      khk_level:
+        description: 'KHK expression level (14-20)'
+        required: true
+        default: '17'
+      tumor_size_target:
+        description: 'Target tumor size (cm)'
+        required: true
+        default: '5'
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libxml2-dev zlib1g-dev
+      
+      - name: Compile PhysiCell
+        run: |
+          cd PhysiCell
+          make template PROJ=HCC_KHK
+          make
+      
+      - name: Run simulation
+        run: |
+          cd PhysiCell
+          ./HCC_KHK --khk ${{ github.event.inputs.khk_level }}
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v2
+        with:
+          name: simulation-output
+          path: PhysiCell/output/
