@@ -53,36 +53,60 @@ jobs:
           echo "=== Updated Configuration ==="
           cat config/PhysiCell_settings.xml | grep -A2 "user_parameters"
       
-      - name: Compile PhysiCell
+      - name: Compile PhysiCell with custom modules
         run: |
-          echo "=== Cleaning previous build (safe) ==="
+          echo "=== Setting up custom project ==="
+          # Link main.cpp to use custom modules
+          cp main.cpp main-backup.cpp
+          
+          echo "=== Cleaning previous build ==="
           make clean
           
           echo ""
-          echo "=== Compiling PhysiCell ==="
+          echo "=== Compiling with custom modules ==="
+          # Compile custom modules explicitly
+          make PhysiCell_custom.o
+          
+          # Build the full project
           make
           
           echo ""
-          echo "=== Checking for executable ==="
-          ls -lh | grep -E "(project|myproj|main)" || ls -lh
+          echo "=== Checking compilation results ==="
+          ls -lh | grep -E "^-rwx" || echo "No executables found yet"
+          
+          # If still no executable, try explicit linking
+          if [ ! -f project ] && [ ! -f myproj ] && [ ! -f heterogeneity ]; then
+            echo "Attempting manual linking..."
+            g++ -std=c++11 -O3 -fomit-frame-pointer -fopenmp -m64 -o project \
+              main.cpp \
+              PhysiCell_*.o BioFVM_*.o pugixml.o custom.o \
+              -lz -lgomp
+          fi
+          
+          echo ""
+          echo "=== Final executable check ==="
+          ls -lh | grep -E "^-rwx"
       
       - name: Run simulation
         run: |
-          # Find the executable
+          # Try different executable names
           if [ -f ./project ]; then
             EXEC=./project
+            echo "Using: project"
+          elif [ -f ./heterogeneity ]; then
+            EXEC=./heterogeneity
+            echo "Using: heterogeneity (will work with custom code)"
           elif [ -f ./myproj ]; then
-            EXEC=./myproj  
-          elif [ -f ./main ]; then
-            EXEC=./main
+            EXEC=./myproj
+            echo "Using: myproj"
           else
             echo "ERROR: No executable found!"
-            echo "Contents of directory:"
-            ls -la
+            echo "Available files:"
+            ls -lh | grep -E "^-rwx"
             exit 1
           fi
           
-          echo "Running: $EXEC"
+          echo "Running simulation with: $EXEC"
           $EXEC
       
       - name: Verify output generated
@@ -95,44 +119,58 @@ jobs:
           echo "=== Simulation output ==="
           ls -lh output/
           
-          FILE_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
-          echo ""
-          echo "Generated $FILE_COUNT XML output files"
-          
+          XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
           SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
-          echo "Generated $SVG_COUNT SVG visualization files"
+          
+          echo ""
+          echo "✓ Generated $XML_COUNT XML files"
+          echo "✓ Generated $SVG_COUNT SVG files"
+          
+          if [ $XML_COUNT -eq 0 ]; then
+            echo "ERROR: No output files generated!"
+            exit 1
+          fi
       
       - name: Create summary
         run: |
           echo "# HCC KHK Simulation Results" > summary.md
           echo "" >> summary.md
           echo "**Patient ID:** ${{ github.event.inputs.patient_id }}" >> summary.md
-          echo "**KHK Expression Level:** ${{ github.event.inputs.khk_level }}" >> summary.md
-          echo "**Simulation Duration:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
+          echo "**KHK Expression:** ${{ github.event.inputs.khk_level }}" >> summary.md
+          echo "**Duration:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
           echo "" >> summary.md
           echo "---" >> summary.md
           echo "" >> summary.md
-          echo "## Output Files Generated" >> summary.md
-          echo "" >> summary.md
-          echo "\`\`\`" >> summary.md
-          ls -lh output/ >> summary.md
-          echo "\`\`\`" >> summary.md
-          echo "" >> summary.md
-          echo "## Quick Stats" >> summary.md
+          
           XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
           SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
-          echo "- XML files: $XML_COUNT" >> summary.md
-          echo "- SVG files: $SVG_COUNT" >> summary.md
+          
+          echo "## Output Summary" >> summary.md
+          echo "- **XML files:** $XML_COUNT" >> summary.md
+          echo "- **SVG files:** $SVG_COUNT" >> summary.md
           echo "" >> summary.md
-          echo "## How to View Results" >> summary.md
-          echo "1. Download and unzip this artifact" >> summary.md
-          echo "2. Open any \`snapshot*.svg\` file in a web browser to see tumor visualization" >> summary.md
-          echo "3. Final snapshot: \`snapshot$(printf '%08d' $((XML_COUNT - 1))).svg\`" >> summary.md
+          
+          echo "## Files Generated" >> summary.md
+          echo "\`\`\`" >> summary.md
+          ls -lh output/ | tail -20 >> summary.md
+          echo "\`\`\`" >> summary.md
+          echo "" >> summary.md
+          
+          echo "## How to View" >> summary.md
+          echo "1. Download and extract this artifact" >> summary.md
+          echo "2. Open \`snapshot*.svg\` files in a web browser" >> summary.md
+          echo "3. Cells are colored by KHK level:" >> summary.md
+          echo "   - **Blue**: Low KHK (<16)" >> summary.md
+          echo "   - **Yellow**: Medium KHK (16-18)" >> summary.md
+          echo "   - **Red**: High KHK (>18)" >> summary.md
+          
+          echo "" >> summary.md
+          echo "Last snapshot: \`snapshot$(printf '%08d' $((XML_COUNT - 1))).svg\`" >> summary.md
       
       - name: Upload simulation results
         uses: actions/upload-artifact@v4
         with:
-          name: simulation-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
+          name: simulation-khk${{ github.event.inputs.khk_level }}-patient${{ github.event.inputs.patient_id }}
           path: |
             output/
             summary.md
