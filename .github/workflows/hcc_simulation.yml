@@ -25,7 +25,7 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - name: Install dependencies
         run: |
@@ -36,6 +36,8 @@ jobs:
         run: |
           sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
           sed -i "s/<max_time.*<\/max_time>/<max_time units=\"min\">${{ github.event.inputs.simulation_time }}<\/max_time>/" config/PhysiCell_settings.xml
+          echo "=== Updated Configuration ==="
+          cat config/PhysiCell_settings.xml | grep -A2 "user_parameters"
       
       - name: Compile PhysiCell
         run: |
@@ -48,15 +50,29 @@ jobs:
       
       - name: Create summary
         run: |
-          echo "Simulation complete!" > summary.md
-          echo "Patient: ${{ github.event.inputs.patient_id }}" >> summary.md
-          echo "KHK: ${{ github.event.inputs.khk_level }}" >> summary.md
+          echo "# Simulation Results" > summary.md
+          echo "" >> summary.md
+          echo "**Patient ID:** ${{ github.event.inputs.patient_id }}" >> summary.md
+          echo "**KHK Expression:** ${{ github.event.inputs.khk_level }}" >> summary.md
+          echo "**Simulation Time:** ${{ github.event.inputs.simulation_time }} minutes" >> summary.md
+          echo "" >> summary.md
+          echo "## Output Files" >> summary.md
+          echo "\`\`\`" >> summary.md
           ls -lh output/ >> summary.md
+          echo "\`\`\`" >> summary.md
+          echo "" >> summary.md
+          echo "## Final Cell Count" >> summary.md
+          if [ -f output/output*.xml ]; then
+            LAST_OUTPUT=$(ls output/output*.xml | tail -1)
+            grep -A1 "number_of_cells" "$LAST_OUTPUT" | tail -1 >> summary.md || echo "N/A" >> summary.md
+          fi
       
-      - name: Upload results
-        uses: actions/upload-artifact@v3
+      - name: Upload simulation results
+        uses: actions/upload-artifact@v4
         with:
-          name: sim-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
+          name: simulation-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
           path: |
             output/
             summary.md
+          retention-days: 30
+          compression-level: 6
