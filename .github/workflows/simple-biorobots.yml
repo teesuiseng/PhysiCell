@@ -1,0 +1,43 @@
+name: My Simple Biorobots Test
+
+on:
+  workflow_dispatch:  # Only run when you manually trigger it
+  # Uncomment below if you want it to run on every push
+  # push:
+  #   branches: [ master ]
+
+jobs:
+  biorobots:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Build PhysiCell Biorobots
+      run: |
+        make data-cleanup
+        make biorobots-sample
+        make PROGRAM_NAME=biorobots
+        
+    - name: Run simulation (120 minutes simulated time)
+      run: |
+        ./biorobots config/PhysiCell_settings.xml
+        
+    - name: Show output files created
+      run: |
+        echo "✅ Simulation complete!"
+        echo "Output files created:"
+        ls -lh output/
+        echo ""
+        echo "Total SVG files:"
+        ls output/*.svg | wc -l
+        
+    - name: Upload SVG visualizations
+      uses: actions/upload-artifact@v3
+      with:
+        name: biorobots-simulation-output
+        path: |
+          output/*.svg
+          output/final.xml
+        retention-days: 5
