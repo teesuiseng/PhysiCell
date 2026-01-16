@@ -2,9 +2,6 @@ name: My Simple Biorobots Test
 
 on:
   workflow_dispatch:  # Only run when you manually trigger it
-  # Uncomment below if you want it to run on every push
-  # push:
-  #   branches: [ master ]
 
 jobs:
   biorobots:
@@ -34,7 +31,7 @@ jobs:
         ls output/*.svg | wc -l
         
     - name: Upload SVG visualizations
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: biorobots-simulation-output
         path: |
