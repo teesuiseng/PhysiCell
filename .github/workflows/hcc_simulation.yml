@@ -1,22 +1,41 @@
-name: HCC KHK Simulation
+name: HCC HBV Recurrence Simulation
 
 on:
   workflow_dispatch:
     inputs:
-      khk_level:
-        description: 'KHK expression level (11-20)'
+      patient_cohort:
+        description: 'Patient cohort to simulate'
         required: true
-        default: '17.0'
-        type: string
-      simulation_time:
-        description: 'Simulation time (minutes)'
-        required: true
-        default: '360'
-        type: string
-      patient_id:
-        description: 'Patient ID'
+        type: choice
+        options:
+          - 'high_risk'      # HBV+ with high viral load
+          - 'low_risk'       # HBV+ with low/undetectable viral load
+          - 'hbv_negative'   # HBV- controls
+          - 'single_patient' # Test single patient
+        default: 'high_risk'
+      
+      hbv_viral_load:
+        description: 'HBV DNA copies/mL (log10 scale, 0-8)'
         required: false
-        default: 'test'
+        default: '5.0'
+        type: string
+      
+      cirrhosis_degree:
+        description: 'Cirrhosis degree (0=none, 1=mild, 2=moderate, 3=severe)'
+        required: false
+        default: '2'
+        type: string
+      
+      simulation_days:
+        description: 'Simulation duration (days)'
+        required: true
+        default: '180'
+        type: string
+      
+      output_interval:
+        description: 'Data sampling interval (hours)'
+        required: true
+        default: '24'
         type: string
 
 jobs:
@@ -30,100 +49,580 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libxml2-dev zlib1g-dev
+          sudo apt-get install -y build-essential libxml2-dev zlib1g-dev python3-pip
+          pip3 install pandas numpy matplotlib seaborn scipy
       
-      - name: Verify custom files
+      - name: Setup patient cohort
         run: |
-          echo "=== Custom modules ==="
-          ls -la custom_modules/
-          if [ ! -f custom_modules/custom.cpp ] || [ ! -f custom_modules/custom.h ]; then
-            echo "ERROR: Custom files missing!"
-            exit 1
-          fi
-          echo "✓ Custom files found"
+          python3 << 'EOF'
+          import json
+          
+          cohort = "${{ github.event.inputs.patient_cohort }}"
+          
+          # Define patient cohorts based on clinical data patterns
+          cohorts = {
+              "high_risk": {
+                  "hbv_dna": [1e6, 1e7, 1e8],  # High viral load
+                  "hbsag": 1,
+                  "hbeag": 1,
+                  "cirrhosis": [2, 3],
+                  "afp": [400, 800, 1200],
+                  "tumor_size": [5, 7, 9],
+                  "description": "HBV+ high viral load, active replication"
+              },
+              "low_risk": {
+                  "hbv_dna": [0, 1e2, 1e3],  # Low/undetectable
+                  "hbsag": 1,
+                  "hbeag": 0,
+                  "cirrhosis": [0, 1],
+                  "afp": [20, 50, 100],
+                  "tumor_size": [2, 3, 4],
+                  "description": "HBV+ low viral load, controlled"
+              },
+              "hbv_negative": {
+                  "hbv_dna": [0],
+                  "hbsag": 0,
+                  "hbeag": 0,
+                  "cirrhosis": [0, 1],
+                  "afp": [15, 30, 60],
+                  "tumor_size": [3, 4, 5],
+                  "description": "HBV- control group"
+              },
+              "single_patient": {
+                  "hbv_dna": [float("${{ github.event.inputs.hbv_viral_load }}")],
+                  "hbsag": 1,
+                  "hbeag": 1 if float("${{ github.event.inputs.hbv_viral_load }}") > 4 else 0,
+                  "cirrhosis": [int("${{ github.event.inputs.cirrhosis_degree }}")],
+                  "afp": [200],
+                  "tumor_size": [5],
+                  "description": "Single patient test"
+              }
+          }
+          
+          with open("cohort_config.json", "w") as f:
+              json.dump(cohorts[cohort], f, indent=2)
+          
+          print(f"=== Cohort: {cohort} ===")
+          print(cohorts[cohort]["description"])
+          EOF
+          
+          cat cohort_config.json
       
-      - name: Update config
+      - name: Generate simulation configs
         run: |
-          sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
-          sed -i "s/<max_time.*<\/max_time>/<max_time units=\"min\">${{ github.event.inputs.simulation_time }}<\/max_time>/" config/PhysiCell_settings.xml
-          echo "=== Config updated ==="
-          grep -A2 "user_parameters" config/PhysiCell_settings.xml
+          python3 << 'EOF'
+          import json
+          import xml.etree.ElementTree as ET
+          from itertools import product
+          
+          # Load cohort
+          with open("cohort_config.json") as f:
+              cohort = json.load(f)
+          
+          # Generate parameter combinations
+          params = []
+          for i, (vl, cirrh, afp, size) in enumerate(product(
+              cohort["hbv_dna"][:3],  # Max 3 viral loads
+              cohort["cirrhosis"][:2],  # Max 2 cirrhosis levels
+              cohort["afp"][:2],  # Max 2 AFP levels
+              cohort["tumor_size"][:2]  # Max 2 tumor sizes
+          )):
+              params.append({
+                  "sim_id": i,
+                  "hbv_dna": vl,
+                  "hbsag": cohort["hbsag"],
+                  "hbeag": cohort["hbeag"],
+                  "cirrhosis": cirrh,
+                  "afp": afp,
+                  "tumor_size": size,
+                  # Derived parameters
+                  "inflammation_level": min(vl / 1e7, 1.0) if vl > 0 else 0,
+                  "immune_suppression": 0.2 + (cirrh * 0.2),  # Higher cirrhosis = worse immune
+                  "proliferation_rate": 0.00072 * (1 + afp/1000),  # AFP correlates with aggressiveness
+                  "initial_cells": int(size ** 3 * 10)  # Volume-based cell count
+              })
+          
+          with open("simulation_params.json", "w") as f:
+              json.dump(params, f, indent=2)
+          
+          print(f"Generated {len(params)} simulation configurations")
+          EOF
+          
+          cat simulation_params.json
       
-      - name: Compile
+      - name: Update PhysiCell config template
+        run: |
+          cat > config/PhysiCell_settings_template.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <PhysiCell_settings version="devel-version">
+            <domain>
+              <x_min>-500</x_min>
+              <x_max>500</x_max>
+              <y_min>-500</y_min>
+              <y_max>500</y_max>
+              <z_min>-10</z_min>
+              <z_max>10</z_max>
+              <dx>20</dx>
+              <dy>20</dy>
+              <dz>20</dz>
+            </domain>
+            
+            <overall>
+              <max_time units="min">SIM_TIME_MINUTES</max_time>
+              <dt_diffusion units="min">0.01</dt_diffusion>
+              <dt_mechanics units="min">0.1</dt_mechanics>
+              <dt_phenotype units="min">6</dt_phenotype>
+            </overall>
+            
+            <save>
+              <folder>output</folder>
+              <full_data>
+                <interval units="min">OUTPUT_INTERVAL_MINUTES</interval>
+                <enable>true</enable>
+              </full_data>
+              <SVG>
+                <interval units="min">999999</interval>  <!-- Disable SVG -->
+                <enable>false</enable>
+              </SVG>
+            </save>
+            
+            <user_parameters>
+              <!-- HBV viral parameters -->
+              <HBV_DNA_copies type="double" units="copies/mL">HBV_DNA_VALUE</HBV_DNA_copies>
+              <HBsAg_positive type="int" units="dimensionless">HBSAG_VALUE</HBsAg_positive>
+              <HBeAg_positive type="int" units="dimensionless">HBEAG_VALUE</HBeAg_positive>
+              
+              <!-- Liver microenvironment -->
+              <cirrhosis_degree type="int" units="grade">CIRRHOSIS_VALUE</cirrhosis_degree>
+              <inflammation_level type="double" units="dimensionless">INFLAMMATION_VALUE</inflammation_level>
+              <immune_suppression type="double" units="dimensionless">IMMUNE_SUPP_VALUE</immune_suppression>
+              
+              <!-- Tumor characteristics -->
+              <AFP_level type="double" units="ng/mL">AFP_VALUE</AFP_level>
+              <tumor_size_cm type="double" units="cm">TUMOR_SIZE_VALUE</tumor_size_cm>
+              <initial_cell_count type="int" units="cells">INITIAL_CELLS_VALUE</initial_cell_count>
+              
+              <!-- Cell behavior modifiers -->
+              <base_proliferation_rate type="double" units="1/min">PROLIF_RATE_VALUE</base_proliferation_rate>
+              <base_apoptosis_rate type="double" units="1/min">0.0001</base_apoptosis_rate>
+              <base_migration_speed type="double" units="micron/min">0.5</base_migration_speed>
+              
+              <!-- Simulation metadata -->
+              <simulation_id type="int" units="dimensionless">SIM_ID_VALUE</simulation_id>
+            </user_parameters>
+            
+            <cell_definitions>
+              <cell_definition name="hcc_cell" ID="0">
+                <phenotype>
+                  <cycle code="5" name="live">  
+                    <phase_transition_rates units="1/min">
+                      <rate start_index="0" end_index="0" fixed_duration="false">PROLIF_RATE_VALUE</rate>
+                    </phase_transition_rates>
+                  </cycle>
+                  
+                  <death>
+                    <model code="100" name="apoptosis">
+                      <death_rate units="1/min">0.0001</death_rate>
+                    </model>
+                  </death>
+                  
+                  <motility>
+                    <speed units="micron/min">0.5</speed>
+                    <persistence_time units="min">5.0</persistence_time>
+                    <migration_bias units="dimensionless">0.5</migration_bias>
+                  </motility>
+                </phenotype>
+              </cell_definition>
+            </cell_definitions>
+          </PhysiCell_settings>
+          XMLEOF
+      
+      - name: Run simulation batch
+        run: |
+          python3 << 'EOF'
+          import json
+          import subprocess
+          import os
+          import shutil
+          
+          with open("simulation_params.json") as f:
+              params_list = json.load(f)
+          
+          results = []
+          
+          for params in params_list:
+              sim_id = params["sim_id"]
+              print(f"\n{'='*60}")
+              print(f"Simulation {sim_id + 1}/{len(params_list)}")
+              print(f"{'='*60}")
+              print(f"HBV DNA: {params['hbv_dna']:.2e} copies/mL")
+              print(f"Cirrhosis: Grade {params['cirrhosis']}")
+              print(f"AFP: {params['afp']} ng/mL")
+              print(f"Tumor size: {params['tumor_size']} cm")
+              
+              # Load template
+              with open("config/PhysiCell_settings_template.xml") as f:
+                  config = f.read()
+              
+              # Calculate time parameters
+              sim_days = int("${{ github.event.inputs.simulation_days }}")
+              output_hours = int("${{ github.event.inputs.output_interval }}")
+              
+              # Replace placeholders
+              replacements = {
+                  "SIM_TIME_MINUTES": str(sim_days * 1440),
+                  "OUTPUT_INTERVAL_MINUTES": str(output_hours * 60),
+                  "HBV_DNA_VALUE": str(params["hbv_dna"]),
+                  "HBSAG_VALUE": str(params["hbsag"]),
+                  "HBEAG_VALUE": str(params["hbeag"]),
+                  "CIRRHOSIS_VALUE": str(params["cirrhosis"]),
+                  "INFLAMMATION_VALUE": str(params["inflammation_level"]),
+                  "IMMUNE_SUPP_VALUE": str(params["immune_suppression"]),
+                  "AFP_VALUE": str(params["afp"]),
+                  "TUMOR_SIZE_VALUE": str(params["tumor_size"]),
+                  "INITIAL_CELLS_VALUE": str(params["initial_cells"]),
+                  "PROLIF_RATE_VALUE": str(params["proliferation_rate"]),
+                  "SIM_ID_VALUE": str(sim_id)
+              }
+              
+              for key, value in replacements.items():
+                  config = config.replace(key, value)
+              
+              # Write config
+              with open("config/PhysiCell_settings.xml", "w") as f:
+                  f.write(config)
+              
+              # Clean output directory
+              if os.path.exists("output"):
+                  shutil.rmtree("output")
+              os.makedirs("output")
+              
+              # Run simulation
+              try:
+                  result = subprocess.run(
+                      ["./heterogeneity"],
+                      capture_output=True,
+                      text=True,
+                      timeout=600  # 10 min timeout per sim
+                  )
+                  
+                  # Move output
+                  output_dir = f"results/sim_{sim_id:03d}"
+                  os.makedirs(output_dir, exist_ok=True)
+                  
+                  if os.path.exists("output"):
+                      for file in os.listdir("output"):
+                          if file.endswith(".xml"):
+                              shutil.move(f"output/{file}", f"{output_dir}/{file}")
+                  
+                  results.append({
+                      "sim_id": sim_id,
+                      "status": "success",
+                      "params": params
+                  })
+                  print("✓ Completed successfully")
+                  
+              except subprocess.TimeoutExpired:
+                  results.append({
+                      "sim_id": sim_id,
+                      "status": "timeout",
+                      "params": params
+                  })
+                  print("✗ Timeout")
+              except Exception as e:
+                  results.append({
+                      "sim_id": sim_id,
+                      "status": "error",
+                      "error": str(e),
+                      "params": params
+                  })
+                  print(f"✗ Error: {e}")
+          
+          # Save results manifest
+          os.makedirs("results", exist_ok=True)
+          with open("results/manifest.json", "w") as f:
+              json.dump(results, f, indent=2)
+          
+          print(f"\n{'='*60}")
+          print(f"Completed {len(results)} simulations")
+          print(f"{'='*60}")
+          EOF
+      
+      - name: Compile PhysiCell
         run: |
           make clean
-          make
-          echo "=== Compilation complete ==="
+          make -j2
           ls -lh heterogeneity
       
-      - name: Run simulation
+      - name: Analyze results
         run: |
-          echo "=== Starting HCC-KHK simulation ==="
-          echo "KHK level: ${{ github.event.inputs.khk_level }}"
-          echo "Duration: ${{ github.event.inputs.simulation_time }} min"
-          ./heterogeneity
-      
-      - name: Check output
-        run: |
-          if [ ! -d output ]; then
-            echo "ERROR: No output directory!"
-            exit 1
-          fi
+          python3 << 'EOF'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          import pandas as pd
+          import numpy as np
+          import matplotlib.pyplot as plt
+          import seaborn as sns
           
-          XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
-          SVG_COUNT=$(ls output/*.svg 2>/dev/null | wc -l)
+          sns.set_style("whitegrid")
           
-          echo "=== Results ==="
-          echo "XML files: $XML_COUNT"
-          echo "SVG files: $SVG_COUNT"
+          # Load manifest
+          with open("results/manifest.json") as f:
+              manifest = json.load(f)
           
-          if [ $XML_COUNT -eq 0 ]; then
-            echo "ERROR: No output generated!"
-            ls -la output/
-            exit 1
-          fi
+          # Extract metrics from each simulation
+          data = []
           
-          echo "✓ Simulation completed successfully"
-      
-      - name: Create summary
-        run: |
-          cat > summary.md << EOF
-          # HCC KHK Simulation Results
+          for sim in manifest:
+              if sim["status"] != "success":
+                  continue
+              
+              sim_id = sim["sim_id"]
+              sim_dir = f"results/sim_{sim_id:03d}"
+              
+              if not os.path.exists(sim_dir):
+                  continue
+              
+              # Get all output files sorted by time
+              xml_files = sorted([f for f in os.listdir(sim_dir) if f.endswith(".xml")])
+              
+              if len(xml_files) < 2:
+                  continue
+              
+              # Parse first and last timepoints
+              first_file = f"{sim_dir}/{xml_files[0]}"
+              last_file = f"{sim_dir}/{xml_files[-1]}"
+              
+              def parse_cells(xml_path):
+                  tree = ET.parse(xml_path)
+                  root = tree.getroot()
+                  
+                  cells = []
+                  for cell in root.findall(".//cell"):
+                      cells.append({
+                          "id": cell.get("ID"),
+                          "type": cell.get("type"),
+                          "volume": float(cell.find(".//total_volume").text) if cell.find(".//total_volume") is not None else 0,
+                          "cycle_phase": cell.find(".//current_phase").text if cell.find(".//current_phase") is not None else "unknown"
+                      })
+                  return pd.DataFrame(cells)
+              
+              try:
+                  df_start = parse_cells(first_file)
+                  df_end = parse_cells(last_file)
+                  
+                  # Calculate metrics
+                  n_start = len(df_start)
+                  n_end = len(df_end)
+                  
+                  if n_start == 0:
+                      continue
+                  
+                  fold_change = n_end / n_start
+                  sim_days = int("${{ github.event.inputs.simulation_days }}")
+                  doubling_time = sim_days / np.log2(fold_change) if fold_change > 1 else np.inf
+                  
+                  # Growth rate (exponential)
+                  growth_rate = np.log(n_end / n_start) / sim_days
+                  
+                  # Aggregate data
+                  data.append({
+                      "sim_id": sim_id,
+                      "hbv_dna": sim["params"]["hbv_dna"],
+                      "hbv_dna_log": np.log10(sim["params"]["hbv_dna"] + 1),
+                      "cirrhosis": sim["params"]["cirrhosis"],
+                      "afp": sim["params"]["afp"],
+                      "tumor_size": sim["params"]["tumor_size"],
+                      "inflammation": sim["params"]["inflammation_level"],
+                      "immune_suppression": sim["params"]["immune_suppression"],
+                      "cells_start": n_start,
+                      "cells_end": n_end,
+                      "fold_change": fold_change,
+                      "doubling_time_days": doubling_time,
+                      "growth_rate": growth_rate,
+                      "timepoints": len(xml_files),
+                      # Risk score (higher = worse prognosis)
+                      "risk_score": growth_rate * sim["params"]["inflammation_level"] * (1 + sim["params"]["cirrhosis"]/3)
+                  })
+              
+              except Exception as e:
+                  print(f"Error parsing sim {sim_id}: {e}")
+                  continue
           
-          **Patient ID:** ${{ github.event.inputs.patient_id }}
-          **KHK Expression:** ${{ github.event.inputs.khk_level }}
-          **Simulation Time:** ${{ github.event.inputs.simulation_time }} minutes
+          if not data:
+              print("ERROR: No valid simulation data")
+              exit(1)
+          
+          df = pd.DataFrame(data)
+          df.to_csv("results/simulation_metrics.csv", index=False)
+          
+          print("\n" + "="*80)
+          print("SIMULATION SUMMARY")
+          print("="*80)
+          print(df.describe())
+          
+          print("\n" + "="*80)
+          print("KEY FINDINGS")
+          print("="*80)
+          
+          # Correlation analysis
+          print("\n1. HBV Viral Load vs Tumor Growth:")
+          corr_hbv_growth = df[["hbv_dna_log", "growth_rate"]].corr().iloc[0, 1]
+          print(f"   Correlation: {corr_hbv_growth:.3f}")
+          print(f"   High viral load (>1e6): avg growth = {df[df['hbv_dna'] > 1e6]['growth_rate'].mean():.4f}")
+          print(f"   Low viral load (<1e3):  avg growth = {df[df['hbv_dna'] < 1e3]['growth_rate'].mean():.4f}")
+          
+          print("\n2. Cirrhosis Impact:")
+          for grade in sorted(df['cirrhosis'].unique()):
+              subset = df[df['cirrhosis'] == grade]
+              print(f"   Grade {grade}: avg doubling time = {subset['doubling_time_days'].mean():.1f} days")
+          
+          print("\n3. Risk Stratification:")
+          high_risk = df[df['risk_score'] > df['risk_score'].quantile(0.75)]
+          low_risk = df[df['risk_score'] < df['risk_score'].quantile(0.25)]
+          print(f"   High risk (top 25%): avg growth rate = {high_risk['growth_rate'].mean():.4f}")
+          print(f"   Low risk (bottom 25%): avg growth rate = {low_risk['growth_rate'].mean():.4f}")
+          print(f"   Fold difference: {high_risk['growth_rate'].mean() / low_risk['growth_rate'].mean():.2f}x")
+          
+          # Generate plots
+          fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+          
+          # 1. HBV viral load vs growth rate
+          ax = axes[0, 0]
+          scatter = ax.scatter(df['hbv_dna_log'], df['growth_rate'], 
+                              c=df['cirrhosis'], cmap='YlOrRd', s=100, alpha=0.7)
+          ax.set_xlabel('HBV DNA (log10 copies/mL)', fontsize=12)
+          ax.set_ylabel('Tumor Growth Rate (1/day)', fontsize=12)
+          ax.set_title('HBV Viral Load vs Growth Rate', fontsize=14, fontweight='bold')
+          plt.colorbar(scatter, ax=ax, label='Cirrhosis Grade')
+          
+          # 2. Cirrhosis impact
+          ax = axes[0, 1]
+          df.boxplot(column='doubling_time_days', by='cirrhosis', ax=ax)
+          ax.set_xlabel('Cirrhosis Grade', fontsize=12)
+          ax.set_ylabel('Doubling Time (days)', fontsize=12)
+          ax.set_title('Cirrhosis Effect on Tumor Doubling Time', fontsize=14, fontweight='bold')
+          plt.sca(ax)
+          plt.xticks(rotation=0)
+          
+          # 3. Risk score distribution
+          ax = axes[0, 2]
+          ax.hist(df['risk_score'], bins=20, color='coral', edgecolor='black', alpha=0.7)
+          ax.axvline(df['risk_score'].median(), color='red', linestyle='--', linewidth=2, label='Median')
+          ax.set_xlabel('Risk Score', fontsize=12)
+          ax.set_ylabel('Frequency', fontsize=12)
+          ax.set_title('Risk Score Distribution', fontsize=14, fontweight='bold')
+          ax.legend()
+          
+          # 4. Inflammation vs growth
+          ax = axes[1, 0]
+          ax.scatter(df['inflammation'], df['growth_rate'], s=100, alpha=0.7, c='steelblue')
+          ax.set_xlabel('Inflammation Level', fontsize=12)
+          ax.set_ylabel('Growth Rate (1/day)', fontsize=12)
+          ax.set_title('Inflammation-Driven Growth', fontsize=14, fontweight='bold')
+          
+          # 5. Fold change comparison
+          ax = axes[1, 1]
+          high_hbv = df[df['hbv_dna'] > 1e5]
+          low_hbv = df[df['hbv_dna'] <= 1e5]
+          ax.bar(['High HBV\n(>10^5)', 'Low HBV\n(≤10^5)'], 
+                 [high_hbv['fold_change'].mean(), low_hbv['fold_change'].mean()],
+                 color=['crimson', 'forestgreen'], alpha=0.7)
+          ax.set_ylabel('Mean Fold Change', fontsize=12)
+          ax.set_title('Tumor Expansion by HBV Status', fontsize=14, fontweight='bold')
+          
+          # 6. Correlation heatmap
+          ax = axes[1, 2]
+          corr_matrix = df[['hbv_dna_log', 'cirrhosis', 'inflammation', 'growth_rate', 'risk_score']].corr()
+          sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax, 
+                     square=True, linewidths=1, cbar_kws={"shrink": 0.8})
+          ax.set_title('Parameter Correlations', fontsize=14, fontweight='bold')
+          
+          plt.tight_layout()
+          plt.savefig('results/analysis_dashboard.png', dpi=300, bbox_inches='tight')
+          print("\n✓ Analysis plots saved to results/analysis_dashboard.png")
+          
+          # Generate markdown report
+          report = f"""# HBV-HCC Recurrence Simulation Report
+          
+          ## Cohort: {cohort}
+          **Simulations completed:** {len(df)}
+          **Simulation duration:** ${{ github.event.inputs.simulation_days }} days
+          **Sampling interval:** ${{ github.event.inputs.output_interval }} hours
           
           ---
           
-          ## Output Files
+          ## Key Findings
           
-          \`\`\`
-          $(ls -lh output/)
-          \`\`\`
+          ### 1. HBV Viral Load Impact
+          - **Correlation with growth rate:** {corr_hbv_growth:.3f}
+          - High viral load (>10⁶): {df[df['hbv_dna'] > 1e6]['growth_rate'].mean():.4f} day⁻¹
+          - Low viral load (<10³): {df[df['hbv_dna'] < 1e3]['growth_rate'].mean():.4f} day⁻¹
+          - **Conclusion:** {"Strong" if abs(corr_hbv_growth) > 0.5 else "Moderate" if abs(corr_hbv_growth) > 0.3 else "Weak"} correlation between viral replication and tumor aggressiveness
           
-          ## File Counts
-          - XML data files: $(ls output/*.xml 2>/dev/null | wc -l)
-          - SVG visualizations: $(ls output/*.svg 2>/dev/null | wc -l)
+          ### 2. Cirrhosis-Mediated Effects
+          """
           
-          ## How to View Results
-          1. Download and extract this artifact
-          2. Open any \`snapshot*.svg\` file in a web browser
-          3. Cell colors indicate KHK expression level:
-             - **Blue**: Low KHK (<16)
-             - **Yellow**: Medium KHK (16-18)  
-             - **Red**: High KHK (>18)
+          for grade in sorted(df['cirrhosis'].unique()):
+              subset = df[df['cirrhosis'] == grade]
+              report += f"- Grade {grade}: {subset['doubling_time_days'].mean():.1f} days doubling time\n"
           
-          ## Timepoints
-          - One snapshot per hour of simulation
-          - Final timepoint: snapshot$(printf '%08d' $(($(ls output/*.xml 2>/dev/null | wc -l) - 1))).svg
+          report += f"""
+          ### 3. Risk Stratification Performance
+          - High-risk patients (top 25%): {high_risk['growth_rate'].mean():.4f} growth rate
+          - Low-risk patients (bottom 25%): {low_risk['growth_rate'].mean():.4f} growth rate
+          - **Risk ratio:** {high_risk['growth_rate'].mean() / low_risk['growth_rate'].mean():.2f}×
+          
+          ---
+          
+          ## Data Files
+          - `simulation_metrics.csv`: Complete quantitative results
+          - `analysis_dashboard.png`: Visual summary
+          - `manifest.json`: Simulation parameters log
+          
+          ## Next Steps
+          {"✓ Model shows clear HBV-growth relationship - ready for validation" if abs(corr_hbv_growth) > 0.4 else "⚠ Weak signal - consider adjusting inflammation/immune parameters"}
+          """
+          
+          with open("results/REPORT.md", "w") as f:
+              f.write(report)
+          
+          print("\n" + "="*80)
+          print("✓ ANALYSIS COMPLETE")
+          print("="*80)
+          print(f"Results saved to results/")
+          print(f"- simulation_metrics.csv ({len(df)} simulations)")
+          print(f"- analysis_dashboard.png")
+          print(f"- REPORT.md")
           EOF
       
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: hcc-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
-          path: |
-            output/
-            summary.md
-          retention-days: 30
+          name: hbv-hcc-analysis-${{ github.event.inputs.patient_cohort }}
+          path: results/
+          retention-days: 90
+      
+      - name: Display key metrics
+        run: |
+          echo "## 🔬 Simulation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          python3 << 'EOF'
+          import pandas as pd
+          import os
+          
+          if os.path.exists("results/simulation_metrics.csv"):
+              df = pd.read_csv("results/simulation_metrics.csv")
+              
+              print("| Metric | Value |")
+              print("|--------|-------|")
+              print(f"| Simulations Completed | {len(df)} |")
+              print(f"| Avg Growth Rate | {df['growth_rate'].mean():.4f} day⁻¹ |")
+              print(f"| Avg Doubling Time | {df['doubling_time_days'].mean():.1f} days |")
+              print(f"| High-risk patients (%) | {(df['risk_score'] > df['risk_score'].quantile(0.75)).sum() / len(df) * 100:.1f}% |")
+              
+              corr = df[["hbv_dna_log", "growth_rate"]].corr().iloc[0, 1]
+              print(f"| HBV-Growth Correlation | {corr:.3f} |")
+          EOF
