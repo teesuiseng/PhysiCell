@@ -1,41 +1,65 @@
-name: HCC KHK Growth Simulation
+name: HCC KHK Simulation
 
 on:
   workflow_dispatch:
     inputs:
       khk_level:
-        description: 'KHK expression level (14-20)'
+        description: 'KHK expression level (11-20)'
         required: true
-        default: '17'
-      tumor_size_target:
-        description: 'Target tumor size (cm)'
+        default: '17.0'
+      simulation_time:
+        description: 'Simulation time (minutes)'
         required: true
-        default: '5'
+        default: '1440'
+      patient_id:
+        description: 'Patient ID'
+        required: false
+        default: 'test'
 
 jobs:
   simulate:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout code
+        uses: actions/checkout@v3
       
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ libxml2-dev zlib1g-dev
+          sudo apt-get install -y build-essential libxml2-dev zlib1g-dev
+      
+      - name: Update config with parameters
+        run: |
+          sed -i "s/<KHK_expression.*<\/KHK_expression>/<KHK_expression type=\"double\" units=\"dimensionless\">${{ github.event.inputs.khk_level }}<\/KHK_expression>/" config/PhysiCell_settings.xml
+          sed -i "s/<max_time.*<\/max_time>/<max_time units=\"min\">${{ github.event.inputs.simulation_time }}<\/max_time>/" config/PhysiCell_settings.xml
+          echo "Configuration updated:"
+          cat config/PhysiCell_settings.xml | grep -A2 "user_parameters"
       
       - name: Compile PhysiCell
         run: |
-          cd PhysiCell
-          make template PROJ=HCC_KHK
+          make clean
           make
       
       - name: Run simulation
         run: |
-          cd PhysiCell
-          ./HCC_KHK --khk ${{ github.event.inputs.khk_level }}
+          ./project
+      
+      - name: Create summary
+        run: |
+          echo "# Simulation Results" > summary.md
+          echo "Patient: ${{ github.event.inputs.patient_id }}" >> summary.md
+          echo "KHK: ${{ github.event.inputs.khk_level }}" >> summary.md
+          echo "Time: ${{ github.event.inputs.simulation_time }} min" >> summary.md
+          echo "" >> summary.md
+          echo "Files generated:" >> summary.md
+          ls -lh output/ >> summary.md
       
       - name: Upload results
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
-          name: simulation-output
-          path: PhysiCell/output/
+          name: simulation-khk${{ github.event.inputs.khk_level }}-${{ github.event.inputs.patient_id }}
+          path: |
+            output/
+            summary.md
+          retention-days: 30
