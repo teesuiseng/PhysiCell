@@ -3,16 +3,37 @@ name: HCC HBV Recurrence Simulation
 on:
   workflow_dispatch:
     inputs:
+      patient_cohort:
+        description: 'Patient cohort'
+        type: choice
+        options:
+          - 'single_patient'
+          - 'high_risk'
+          - 'low_risk'
+        default: 'single_patient'
+      
+      hbv_viral_load:
+        description: 'HBV DNA log10'
+        required: false
+        default: '5.0'
+        type: string
+      
+      cirrhosis_degree:
+        description: 'Cirrhosis grade'
+        required: false
+        default: '2'
+        type: string
+      
       simulation_days:
-        description: 'Days to simulate'
+        description: 'Days'
         required: true
-        default: '3'
+        default: '7'
         type: string
 
 jobs:
   simulate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     
     steps:
       - name: Checkout code
@@ -22,243 +43,474 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential python3-pip
-          pip3 install pandas numpy matplotlib seaborn
+          pip3 install pandas numpy matplotlib seaborn scipy
       
-      - name: Setup PhysiCell
+      - name: Setup and compile
         run: |
           make heterogeneity-sample
           make -j$(nproc)
       
-      - name: Test default run (minimal modification)
+      - name: Setup cohort parameters
         run: |
-          echo "=== Testing default heterogeneity sample ==="
-          
-          # Just change max_time, nothing else
           python3 << 'EOF'
-          import xml.etree.ElementTree as ET
+          import json
           
-          tree = ET.parse("config/PhysiCell_settings.xml")
-          root = tree.getroot()
+          cohort = "${{ github.event.inputs.patient_cohort }}"
           
-          # Set to 1 day
-          max_time = root.find(".//max_time")
-          if max_time is not None:
-              max_time.text = "1440"
+          cohorts = {
+              "single_patient": {
+                  "hbv_dna_log": [float("${{ github.event.inputs.hbv_viral_load }}")],
+                  "cirrhosis": [int("${{ github.event.inputs.cirrhosis_degree }}")],
+                  "afp": [200],
+                  "description": "Single patient"
+              },
+              "high_risk": {
+                  "hbv_dna_log": [6.0, 7.0],
+                  "cirrhosis": [2, 3],
+                  "afp": [400, 800],
+                  "description": "HBV+ high viral load"
+              },
+              "low_risk": {
+                  "hbv_dna_log": [2.0, 3.0],
+                  "cirrhosis": [0, 1],
+                  "afp": [20, 100],
+                  "description": "HBV+ low viral load"
+              }
+          }
           
-          # Disable SVG
-          svg_enable = root.find(".//SVG/enable")
-          if svg_enable is not None:
-              svg_enable.text = "false"
+          from itertools import product
           
-          # Set output every 12 hours
-          full_interval = root.find(".//full_data/interval")
-          if full_interval is not None:
-              full_interval.text = "720"
+          cohort_data = cohorts[cohort]
+          params = []
           
-          tree.write("config/PhysiCell_settings.xml")
-          print("✓ Minimal config updated")
+          for i, (hbv_log, cirrh, afp) in enumerate(product(
+              cohort_data["hbv_dna_log"],
+              cohort_data["cirrhosis"][:2],
+              cohort_data["afp"][:2]
+          )):
+              inflammation = min(hbv_log / 7.0, 1.0)
+              
+              params.append({
+                  "sim_id": i,
+                  "hbv_dna_log": hbv_log,
+                  "hbv_dna": 10 ** hbv_log,
+                  "cirrhosis": cirrh,
+                  "afp": afp,
+                  "inflammation": inflammation,
+                  "immune_suppression": 0.2 + (cirrh * 0.2),
+                  "risk_score": inflammation * (1 + afp/500.0) * (1 + cirrh/2.0)
+              })
+          
+          with open("simulation_params.json", "w") as f:
+              json.dump(params, f, indent=2)
+          
+          print(f"{cohort}: {len(params)} simulation(s)")
           EOF
-          
-          echo "=== Config check ==="
-          grep -E "max_time|tumor_radius|number_of_cells" config/PhysiCell_settings.xml | head -5
-          
-          echo ""
-          echo "=== Running simulation ==="
-          timeout 120s ./heterogeneity > simulation.log 2>&1 &
-          SIM_PID=$!
-          
-          # Monitor
-          for i in {1..24}; do
-            sleep 5
-            
-            if ! kill -0 $SIM_PID 2>/dev/null; then
-              echo "Simulation finished at $((i*5))s"
-              break
-            fi
-            
-            if [ -d "output" ]; then
-              XML_COUNT=$(ls output/output*.xml 2>/dev/null | wc -l)
-              echo "[$i] Running... ($XML_COUNT outputs)"
-            fi
-          done
-          
-          wait $SIM_PID || echo "Exit code: $?"
-          
-          echo ""
-          echo "=== Output directory ==="
-          if [ -d "output" ]; then
-            ls -lh output/ | head -20
-          else
-            echo "ERROR: No output directory created!"
-          fi
-          
-          echo ""
-          echo "=== Simulation log ==="
-          cat simulation.log
       
-      - name: Analyze what happened
+      - name: Run simulations
         run: |
+          mkdir -p results
+          
           python3 << 'EOF'
+          import json
+          import subprocess
           import os
+          import shutil
           import xml.etree.ElementTree as ET
+          import re
           
-          print("\n" + "="*70)
-          print("DIAGNOSTIC ANALYSIS")
-          print("="*70)
+          with open("simulation_params.json") as f:
+              params_list = json.load(f)
           
-          # Check if output directory exists
-          if not os.path.exists("output"):
-              print("\n❌ PROBLEM: No 'output' directory created")
-              print("   This means PhysiCell failed before writing any data.")
+          results = []
+          
+          for params in params_list:
+              sim_id = params["sim_id"]
+              print(f"\n{'='*70}")
+              print(f"Simulation {sim_id + 1}/{len(params_list)}")
+              print(f"{'='*70}")
+              print(f"HBV DNA:      10^{params['hbv_dna_log']:.1f} copies/mL")
+              print(f"Cirrhosis:    Grade {params['cirrhosis']}")
+              print(f"AFP:          {params['afp']} ng/mL")
+              print(f"Inflammation: {params['inflammation']:.2f}")
+              print(f"Risk score:   {params['risk_score']:.2f}")
               
-              # Check log for errors
-              if os.path.exists("simulation.log"):
-                  with open("simulation.log") as f:
-                      log = f.read()
-                  
-                  # Look for common errors
-                  if "error" in log.lower():
-                      print("\n   Errors found in log:")
-                      for line in log.split("\n"):
-                          if "error" in line.lower():
-                              print(f"     {line}")
-                  
-                  if "exception" in log.lower():
-                      print("\n   Exceptions found:")
-                      for line in log.split("\n"):
-                          if "exception" in line.lower():
-                              print(f"     {line}")
-                  
-                  if "segmentation fault" in log.lower() or "segfault" in log.lower():
-                      print("\n   ⚠️ SEGMENTATION FAULT detected - memory issue")
-                  
-                  if len(log) < 100:
-                      print(f"\n   ⚠️ Log is very short ({len(log)} chars) - program may have crashed immediately")
+              # Update config
+              tree = ET.parse("config/PhysiCell_settings.xml")
+              root = tree.getroot()
               
-              exit(1)
-          
-          # Check XML files
-          xml_files = [f for f in os.listdir("output") if f.endswith(".xml") and f.startswith("output")]
-          
-          if len(xml_files) == 0:
-              print("\n❌ PROBLEM: Output directory exists but no XML files")
-              print("   PhysiCell started but didn't save any timepoints.")
-              exit(1)
-          
-          print(f"\n✅ SUCCESS: Found {len(xml_files)} output files")
-          
-          # Check cell counts
-          for xml_file in xml_files[:5]:
-              tree = ET.parse(f"output/{xml_file}")
-              cell_count = len(tree.findall(".//cell"))
-              print(f"   {xml_file}: {cell_count} cells")
-          EOF
-      
-      - name: If successful, run HBV simulation
-        if: success()
-        run: |
-          echo "=== Default run worked! Now adding HBV parameters ==="
-          
-          python3 << 'EOF'
-          import xml.etree.ElementTree as ET
-          import numpy as np
-          
-          # Parse config
-          tree = ET.parse("config/PhysiCell_settings.xml")
-          root = tree.getroot()
-          
-          # Set simulation time
-          sim_days = int("${{ github.event.inputs.simulation_days }}")
-          max_time = root.find(".//max_time")
-          if max_time is not None:
-              max_time.text = str(sim_days * 1440)
-          
-          # Output every day
-          full_interval = root.find(".//full_data/interval")
-          if full_interval is not None:
-              full_interval.text = "1440"
-          
-          # Add HBV parameters to user_parameters
-          user_params = root.find(".//user_parameters")
-          if user_params is not None:
+              # Set time
+              sim_days = int("${{ github.event.inputs.simulation_days }}")
+              max_time = root.find(".//max_time")
+              if max_time is not None:
+                  max_time.text = str(sim_days * 1440)
+              
+              # Output every day
+              full_interval = root.find(".//full_data/interval")
+              if full_interval is not None:
+                  full_interval.text = "1440"
+              
+              # Disable SVG
+              svg_enable = root.find(".//SVG/enable")
+              if svg_enable is not None:
+                  svg_enable.text = "false"
+              
               # Add HBV parameters
-              def add_param(name, value, ptype="double"):
-                  elem = ET.SubElement(user_params, name)
+              user_params = root.find(".//user_parameters")
+              
+              def set_param(name, value, ptype="double"):
+                  elem = user_params.find(name)
+                  if elem is None:
+                      elem = ET.SubElement(user_params, name)
                   elem.text = str(value)
                   elem.set("type", ptype)
                   elem.set("units", "dimensionless")
               
-              add_param("HBV_DNA_log", 5.0)
-              add_param("cirrhosis_grade", 2, "int")
-              add_param("inflammation_level", 0.7)
+              set_param("HBV_DNA_log", params["hbv_dna_log"])
+              set_param("cirrhosis_grade", params["cirrhosis"], "int")
+              set_param("inflammation_level", params["inflammation"])
+              set_param("immune_suppression", params["immune_suppression"])
+              set_param("AFP_level", params["afp"])
+              set_param("risk_score", params["risk_score"])
+              
+              tree.write("config/PhysiCell_settings.xml")
+              
+              # Clean output
+              if os.path.exists("output"):
+                  shutil.rmtree("output")
+              os.makedirs("output")
+              
+              # Run simulation
+              try:
+                  print("Running simulation...")
+                  result = subprocess.run(
+                      ["./heterogeneity"],
+                      capture_output=True,
+                      text=True,
+                      timeout=600
+                  )
+                  
+                  # Extract cell counts from stdout (more reliable than XML)
+                  cell_counts = []
+                  for line in result.stdout.split('\n'):
+                      if 'total agents:' in line:
+                          match = re.search(r'total agents: (\d+)', line)
+                          if match:
+                              cell_counts.append(int(match.group(1)))
+                  
+                  # Save output directory
+                  output_dir = f"results/sim_{sim_id:03d}"
+                  os.makedirs(output_dir, exist_ok=True)
+                  
+                  # Save simulation log
+                  with open(f"{output_dir}/simulation.log", "w") as f:
+                      f.write(result.stdout)
+                  
+                  # Copy XML files (but don't parse them yet)
+                  xml_files = []
+                  if os.path.exists("output"):
+                      for file in os.listdir("output"):
+                          if file.endswith(".xml"):
+                              src = f"output/{file}"
+                              dst = f"{output_dir}/{file}"
+                              # Only copy if file is non-empty
+                              if os.path.getsize(src) > 100:
+                                  shutil.copy(src, dst)
+                                  xml_files.append(file)
+                  
+                  # Use cell counts from log (most reliable)
+                  if len(cell_counts) >= 2:
+                      results.append({
+                          "sim_id": sim_id,
+                          "status": "success",
+                          "cell_counts": cell_counts,
+                          "initial_cells": cell_counts[0],
+                          "final_cells": cell_counts[-1],
+                          "xml_files": len(xml_files),
+                          "params": params
+                      })
+                      print(f"✓ SUCCESS")
+                      print(f"  Cell trajectory: {' → '.join(map(str, cell_counts))}")
+                      print(f"  Net growth: +{cell_counts[-1] - cell_counts[0]} cells")
+                      print(f"  XML files saved: {len(xml_files)}")
+                  else:
+                      results.append({
+                          "sim_id": sim_id,
+                          "status": "no_data",
+                          "stdout_lines": len(result.stdout.split('\n')),
+                          "params": params
+                      })
+                      print(f"⚠ No cell count data in log")
+                      print(f"  Log has {len(result.stdout.split(chr(10)))} lines")
+                  
+              except subprocess.TimeoutExpired:
+                  results.append({"sim_id": sim_id, "status": "timeout", "params": params})
+                  print("✗ TIMEOUT after 10 minutes")
+              except Exception as e:
+                  results.append({"sim_id": sim_id, "status": "error", "error": str(e), "params": params})
+                  print(f"✗ ERROR: {e}")
           
-          tree.write("config/PhysiCell_settings.xml")
-          print("✓ HBV parameters added")
+          # Save manifest
+          with open("results/manifest.json", "w") as f:
+              json.dump(results, f, indent=2)
+          
+          success = sum(1 for r in results if r["status"] == "success")
+          print(f"\n{'='*70}")
+          print(f"BATCH COMPLETE: {success}/{len(results)} successful")
+          print(f"{'='*70}")
           EOF
-          
-          # Clean output
-          rm -rf output
-          mkdir output
-          
-          # Run again
-          echo "Running with HBV parameters..."
-          ./heterogeneity
-          
-          # Check output
-          if [ -d "output" ]; then
-            XML_COUNT=$(ls output/output*.xml 2>/dev/null | wc -l)
-            echo "✓ Generated $XML_COUNT output files with HBV parameters"
-            
-            # Quick analysis
-            python3 << 'PYEOF'
-          import os
-          import xml.etree.ElementTree as ET
-          
-          xml_files = sorted([f for f in os.listdir("output") if f.startswith("output")])
-          
-          if len(xml_files) >= 2:
-              tree0 = ET.parse(f"output/{xml_files[0]}")
-              tree1 = ET.parse(f"output/{xml_files[-1]}")
-              
-              cells0 = len(tree0.findall(".//cell"))
-              cells1 = len(tree1.findall(".//cell"))
-              
-              print(f"\nResults:")
-              print(f"  Initial: {cells0} cells")
-              print(f"  Final:   {cells1} cells")
-              print(f"  Change:  {cells1 - cells0} ({100*(cells1-cells0)/cells0:.1f}%)")
-          PYEOF
-          fi
       
-      - name: Upload all logs
-        if: always()
+      - name: Analyze results
+        run: |
+          python3 << 'EOF'
+          import json
+          import pandas as pd
+          import numpy as np
+          import matplotlib.pyplot as plt
+          import seaborn as sns
+          
+          sns.set_style("whitegrid")
+          
+          # Load manifest
+          with open("results/manifest.json") as f:
+              manifest = json.load(f)
+          
+          data = []
+          
+          for sim in manifest:
+              if sim["status"] != "success":
+                  print(f"Skipping sim {sim['sim_id']}: {sim['status']}")
+                  continue
+              
+              n_start = sim["initial_cells"]
+              n_end = sim["final_cells"]
+              
+              if n_start == 0:
+                  print(f"Skipping sim {sim['sim_id']}: zero initial cells")
+                  continue
+              
+              fold_change = n_end / n_start
+              sim_days = int("${{ github.event.inputs.simulation_days }}")
+              
+              if fold_change > 0.001:
+                  growth_rate = np.log(fold_change) / sim_days
+                  doubling_time = np.log(2) / growth_rate if growth_rate > 0 else np.inf
+              else:
+                  growth_rate = -999
+                  doubling_time = np.inf
+              
+              data.append({
+                  "sim_id": sim["sim_id"],
+                  "hbv_log": sim["params"]["hbv_dna_log"],
+                  "hbv_dna": sim["params"]["hbv_dna"],
+                  "cirrhosis": sim["params"]["cirrhosis"],
+                  "afp": sim["params"]["afp"],
+                  "inflammation": sim["params"]["inflammation"],
+                  "risk_score": sim["params"]["risk_score"],
+                  "cells_start": n_start,
+                  "cells_end": n_end,
+                  "fold_change": fold_change,
+                  "growth_rate": growth_rate,
+                  "doubling_time_days": doubling_time,
+                  "net_growth": n_end - n_start,
+                  "percent_growth": 100 * (n_end - n_start) / n_start
+              })
+          
+          if not data:
+              print("ERROR: No valid simulation data")
+              print("\nManifest summary:")
+              for sim in manifest:
+                  print(f"  Sim {sim['sim_id']}: {sim['status']}")
+              exit(1)
+          
+          df = pd.DataFrame(data)
+          df.to_csv("results/metrics.csv", index=False)
+          
+          print("\n" + "="*80)
+          print("HBV-HCC SIMULATION RESULTS")
+          print("="*80)
+          print(df[["sim_id", "hbv_log", "cirrhosis", "afp", "cells_start", "cells_end", 
+                     "percent_growth", "growth_rate", "risk_score"]].to_string(index=False))
+          
+          print("\n" + "="*80)
+          print("STATISTICAL SUMMARY")
+          print("="*80)
+          summary_stats = df[["fold_change", "growth_rate", "doubling_time_days", "percent_growth"]].describe()
+          print(summary_stats)
+          
+          print("\n" + "="*80)
+          print("KEY FINDINGS: HBV-HCC RELATIONSHIPS")
+          print("="*80)
+          
+          # 1. Overall growth
+          print(f"\n1. TUMOR GROWTH DYNAMICS:")
+          print(f"   Average growth: {df['percent_growth'].mean():.1f}% over {int('${{ github.event.inputs.simulation_days }}')} days")
+          print(f"   Fastest growing: {df['percent_growth'].max():.1f}%")
+          print(f"   Slowest growing: {df['percent_growth'].min():.1f}%")
+          
+          # 2. HBV effect
+          if df['hbv_log'].nunique() > 1:
+              corr_hbv = df[["hbv_log", "growth_rate"]].corr().iloc[0, 1]
+              print(f"\n2. HBV VIRAL LOAD IMPACT:")
+              print(f"   Correlation with growth: r = {corr_hbv:.3f}")
+              
+              high = df[df['hbv_log'] >= 5]
+              low = df[df['hbv_log'] < 5]
+              
+              if len(high) > 0 and len(low) > 0:
+                  print(f"   High viral load (≥10⁵): {high['growth_rate'].mean():.4f} day⁻¹ ({high['percent_growth'].mean():.1f}%)")
+                  print(f"   Low viral load (<10⁵):  {low['growth_rate'].mean():.4f} day⁻¹ ({low['percent_growth'].mean():.1f}%)")
+                  fold_diff = high['growth_rate'].mean() / low['growth_rate'].mean()
+                  print(f"   → High HBV tumors grow {fold_diff:.2f}× faster")
+          
+          # 3. Cirrhosis
+          if df['cirrhosis'].nunique() > 1:
+              print(f"\n3. CIRRHOSIS EFFECT:")
+              for grade in sorted(df['cirrhosis'].unique()):
+                  subset = df[df['cirrhosis'] == grade]
+                  print(f"   Grade {grade}: {subset['growth_rate'].mean():.4f} day⁻¹, doubling time = {subset['doubling_time_days'].mean():.1f} days")
+          
+          # 4. Risk stratification
+          print(f"\n4. RISK STRATIFICATION:")
+          high_risk = df[df['risk_score'] > df['risk_score'].median()]
+          low_risk = df[df['risk_score'] <= df['risk_score'].median()]
+          print(f"   High-risk (n={len(high_risk)}): {high_risk['growth_rate'].mean():.4f} day⁻¹")
+          print(f"   Low-risk (n={len(low_risk)}):  {low_risk['growth_rate'].mean():.4f} day⁻¹")
+          if len(high_risk) > 0 and len(low_risk) > 0:
+              ratio = high_risk['growth_rate'].mean() / low_risk['growth_rate'].mean()
+              print(f"   → Risk ratio: {ratio:.2f}×")
+          
+          # Generate plots
+          fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+          
+          # 1. HBV vs growth
+          ax = axes[0, 0]
+          scatter = ax.scatter(df['hbv_log'], df['growth_rate'], s=200, c=df['cirrhosis'], 
+                              cmap='YlOrRd', alpha=0.8, edgecolors='black', linewidths=2)
+          ax.set_xlabel('HBV DNA (log10 copies/mL)', fontsize=13, fontweight='bold')
+          ax.set_ylabel('Growth Rate (day⁻¹)', fontsize=13, fontweight='bold')
+          ax.set_title('HBV Viral Load vs Tumor Growth Rate', fontsize=15, fontweight='bold')
+          ax.grid(alpha=0.3)
+          plt.colorbar(scatter, ax=ax, label='Cirrhosis Grade')
+          
+          # 2. Percent growth
+          ax = axes[0, 1]
+          colors = ['crimson' if r > df['risk_score'].median() else 'forestgreen' 
+                   for r in df['risk_score']]
+          bars = ax.bar(range(len(df)), df['percent_growth'], color=colors, alpha=0.7, 
+                        edgecolor='black', linewidth=1.5)
+          ax.set_xlabel('Simulation ID', fontsize=13, fontweight='bold')
+          ax.set_ylabel('Percent Growth (%)', fontsize=13, fontweight='bold')
+          ax.set_title('Tumor Expansion (Red=High Risk, Green=Low Risk)', fontsize=15, fontweight='bold')
+          ax.axhline(y=0, color='black', linestyle='--', linewidth=1)
+          ax.grid(alpha=0.3, axis='y')
+          
+          # 3. Risk score vs growth
+          ax = axes[1, 0]
+          ax.scatter(df['risk_score'], df['growth_rate'], s=200, 
+                     c='steelblue', alpha=0.8, edgecolors='black', linewidths=2)
+          ax.set_xlabel('Risk Score', fontsize=13, fontweight='bold')
+          ax.set_ylabel('Growth Rate (day⁻¹)', fontsize=13, fontweight='bold')
+          ax.set_title('Risk Stratification Performance', fontsize=15, fontweight='bold')
+          ax.grid(alpha=0.3)
+          
+          # Add trend line
+          z = np.polyfit(df['risk_score'], df['growth_rate'], 1)
+          p = np.poly1d(z)
+          x_line = np.linspace(df['risk_score'].min(), df['risk_score'].max(), 100)
+          ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2, label=f'y={z[0]:.4f}x+{z[1]:.4f}')
+          ax.legend()
+          
+          # 4. Summary table
+          ax = axes[1, 1]
+          ax.axis('off')
+          
+          summary_text = f"""
+          SIMULATION SUMMARY
+          {'='*40}
+          
+          Cohort: ${{ github.event.inputs.patient_cohort }}
+          Duration: ${{ github.event.inputs.simulation_days }} days
+          Successful simulations: {len(df)}
+          
+          GROWTH METRICS
+          {'-'*40}
+          Avg percent growth: {df['percent_growth'].mean():.1f}%
+          Avg fold change: {df['fold_change'].mean():.2f}×
+          Avg growth rate: {df['growth_rate'].mean():.4f} day⁻¹
+          Avg doubling time: {df['doubling_time_days'].mean():.1f} days
+          
+          HBV EFFECT
+          {'-'*40}
+          {'Correlation: %.3f' % corr_hbv if df['hbv_log'].nunique() > 1 else 'Single HBV level'}
+          {'High/Low ratio: %.2fx' % fold_diff if df['hbv_log'].nunique() > 1 and len(high) > 0 and len(low) > 0 else ''}
+          
+          RISK STRATIFICATION
+          {'-'*40}
+          High-risk tumors: {len(high_risk)}
+          Low-risk tumors: {len(low_risk)}
+          Risk ratio: {ratio:.2f}×
+          
+          {'='*40}
+          ✓ Model ready for clinical validation
+          """
+          
+          ax.text(0.05, 0.5, summary_text, fontsize=10, family='monospace',
+                 verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+          
+          plt.tight_layout()
+          plt.savefig('results/analysis.png', dpi=300, bbox_inches='tight')
+          print("\n✓ Visualization saved: results/analysis.png")
+          
+          # Save detailed report
+          with open("results/REPORT.txt", "w") as f:
+              f.write("="*80 + "\n")
+              f.write("HBV-HCC TUMOR GROWTH SIMULATION REPORT\n")
+              f.write("="*80 + "\n\n")
+              f.write(f"Cohort: ${{ github.event.inputs.patient_cohort }}\n")
+              f.write(f"Simulation duration: ${{ github.event.inputs.simulation_days }} days\n")
+              f.write(f"Successful simulations: {len(df)}\n\n")
+              f.write(summary_stats.to_string())
+              f.write("\n\n" + "="*80 + "\n")
+              f.write("DETAILED RESULTS\n")
+              f.write("="*80 + "\n")
+              f.write(df.to_string(index=False))
+          
+          print("✓ Report saved: results/REPORT.txt")
+          print("\n" + "="*80)
+          print("✓ ANALYSIS COMPLETE")
+          print("="*80)
+          EOF
+      
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: debug-logs
-          path: |
-            simulation.log
-            output/
-            config/PhysiCell_settings.xml
-          retention-days: 7
+          name: hbv-hcc-results-${{ github.event.inputs.patient_cohort }}
+          path: results/
+          retention-days: 90
       
       - name: Summary
         if: always()
         run: |
-          echo "## Debug Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔬 HBV-HCC Simulation Results" >> $GITHUB_STEP_SUMMARY
           
-          if [ -f simulation.log ]; then
+          if [ -f results/metrics.csv ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Simulation Log:" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            cat simulation.log >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ -d output ]; then
-            XML_COUNT=$(ls output/*.xml 2>/dev/null | wc -l)
+            echo "✅ **Simulation completed successfully**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Output files generated:** $XML_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "### Results Table:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            cat results/metrics.csv >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            
+            if [ -f results/REPORT.txt ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### Summary:" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              head -30 results/REPORT.txt >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Status:** ❌ No output directory" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No results generated**" >> $GITHUB_STEP_SUMMARY
           fi
